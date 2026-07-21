@@ -20,11 +20,17 @@ WIFI_SSID = "M5_POINT_CLOUD"
 WIFI_PASSWORD = "m5pointcloud"
 UDP_PORT = 4210
 MAGIC = b"PCLD"
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 4
 FRAME_FORMAT_V1 = "<4sBBBBIhhhhhhh16s192HH"
 FRAME_FORMAT_V2 = "<4sBBBBIhhhhhhhhhhhhhIII16s192HH"
+# v3: accelZmilliGの直後にbmaAccelX/Y/ZmilliG(BMA400, TCA CH0)を追加。
+FRAME_FORMAT_V3 = "<4sBBBBIhhhhhhhhhhhhhhhhIII16s192HH"
+# v4: bmaAccelZmilliGの直後にtrimMilli/calRound/calPass/calDriftCdeg(キャリブ進行状況)を追加。
+FRAME_FORMAT_V4 = "<4sBBBBIhhhhhhhhhhhhhhBBhhhhIII16s192HH"
 FRAME_SIZE_V1 = struct.calcsize(FRAME_FORMAT_V1)
 FRAME_SIZE_V2 = struct.calcsize(FRAME_FORMAT_V2)
+FRAME_SIZE_V3 = struct.calcsize(FRAME_FORMAT_V3)
+FRAME_SIZE_V4 = struct.calcsize(FRAME_FORMAT_V4)
 SENSOR_ANGLES_DEG = (0.0, 50.0, -50.0)
 SENSOR_COLORS = ("#42d7ff", "#66ff88", "#ffad42")
 SENSOR_NAMES = ("FRONT", "LEFT", "RIGHT")
@@ -44,7 +50,7 @@ ACCEL_DEADBAND_G = 0.018
 ACCEL_LOW_PASS_ALPHA = 0.35
 MOTOR_DRIFT_BLEND = 0.12
 
-STATE_NAMES = {0: "FORWARD", 1: "PIVOT", 2: "BACK"}
+STATE_NAMES = {0: "FORWARD", 1: "PIVOT", 2: "BACK", 3: "CALIBRATING"}
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -76,6 +82,13 @@ class PointCloudFrame:
     reason: str
     distances: tuple[int, ...]
     sender: str = ""
+    bma_accel_x_g: float = 0.0
+    bma_accel_y_g: float = 0.0
+    bma_accel_z_g: float = 0.0
+    trim: float = 0.0
+    cal_round: int = 0
+    cal_pass: int = 0
+    cal_drift_deg: float = 0.0
 
     @property
     def drive_enabled(self) -> bool: return bool(self.flags & 0x01)
@@ -91,6 +104,9 @@ class PointCloudFrame:
 
     @property
     def wifi_client(self) -> bool: return bool(self.flags & 0x10)
+
+    @property
+    def bma_ok(self) -> bool: return bool(self.flags & 0x20)
 
 
 @dataclass
@@ -151,8 +167,28 @@ class DeadReckoningMap:
                 old_vx, old_vy = self.velocity_x_mm_s, self.velocity_y_mm_s
                 mid_heading = math.radians(self.heading_deg + yaw_delta * 0.5)
 
-                accel_x_g = (previous.accel_x_g + frame.accel_x_g) * 0.5
-                accel_y_g = (previous.accel_y_g + frame.accel_y_g) * 0.5
+                # M5StickC PlusはUSB端子を車体前面、画面を車体上面にして水平取付されている。
+                # 標準姿勢(画面を正面に見てUSB下)基準のIMU軸だとX+=画面右/Y+=画面上(USB反対側)/
+                # Z+=画面から手前なので、この取付だとIMU X+は車体左、IMU Y+は車体後ろを向く
+                # (Z+は車体上面で一致)。ロボット座標(local_x=右, local_y=前)に合わせるため、
+                # 両軸とも符号反転させて読む。
+                m5_accel_x_g = -(previous.accel_x_g + frame.accel_x_g) * 0.5
+                m5_accel_y_g = -(previous.accel_y_g + frame.accel_y_g) * 0.5
+
+                # BMA400(TCA CH0, v3)。コネクタが車体後ろ向きの取付から、データシートの
+                # センサー座標系(Z=チップ面から手前、Y=コネクタと反対方向、X=Y×Zの右手系)と
+                # 照合すると生値がそのままX=車体右/Y=車体前方になる想定(符号反転・軸入替なし)。
+                # M5内蔵IMUとは別センサーなので、両方揃っている間は単純平均でブレンドし、
+                # 片方しか無ければそちらだけを使う。
+                bma_available = previous.bma_ok and frame.bma_ok
+                if bma_available:
+                    bma_x_g = (previous.bma_accel_x_g + frame.bma_accel_x_g) * 0.5
+                    bma_y_g = (previous.bma_accel_y_g + frame.bma_accel_y_g) * 0.5
+                    accel_x_g = (m5_accel_x_g + bma_x_g) * 0.5
+                    accel_y_g = (m5_accel_y_g + bma_y_g) * 0.5
+                else:
+                    accel_x_g = m5_accel_x_g
+                    accel_y_g = m5_accel_y_g
                 if abs(accel_x_g) < ACCEL_DEADBAND_G:
                     accel_x_g = 0.0
                 if abs(accel_y_g) < ACCEL_DEADBAND_G:
@@ -272,25 +308,50 @@ class DeadReckoningMap:
 
 
 def decode_frame(raw: bytes, sender: str = "") -> PointCloudFrame:
-    if len(raw) not in (FRAME_SIZE_V1, FRAME_SIZE_V2) or raw[:4] != MAGIC:
+    if len(raw) not in (FRAME_SIZE_V1, FRAME_SIZE_V2, FRAME_SIZE_V3, FRAME_SIZE_V4) or raw[:4] != MAGIC:
         raise ValueError("invalid frame")
     crc_offset = len(raw) - 2
     expected_crc = struct.unpack_from("<H", raw, crc_offset)[0]
     if crc16_ccitt(raw[:crc_offset]) != expected_crc:
         raise ValueError("CRC mismatch")
     version = raw[4]
+    bma_accel_x_g = bma_accel_y_g = bma_accel_z_g = 0.0
+    trim = 0.0
+    cal_round = cal_pass = 0
+    cal_drift_deg = 0.0
     if version == 1 and len(raw) == FRAME_SIZE_V1:
         values = struct.unpack(FRAME_FORMAT_V1, raw)
         accel_x_g = accel_y_g = accel_z_g = 0.0
         sensor_yaw_deg = (values[6] / 100.0,) * 3
         sensor_timestamp_ms = (values[5],) * 3
         reason_index, distance_index = 13, 14
-    elif version == PROTOCOL_VERSION and len(raw) == FRAME_SIZE_V2:
+    elif version == 2 and len(raw) == FRAME_SIZE_V2:
         values = struct.unpack(FRAME_FORMAT_V2, raw)
         accel_x_g, accel_y_g, accel_z_g = values[13] / 1000.0, values[14] / 1000.0, values[15] / 1000.0
         sensor_yaw_deg = (values[16] / 100.0, values[17] / 100.0, values[18] / 100.0)
         sensor_timestamp_ms = (values[19], values[20], values[21])
         reason_index, distance_index = 22, 23
+    elif version == 3 and len(raw) == FRAME_SIZE_V3:
+        values = struct.unpack(FRAME_FORMAT_V3, raw)
+        accel_x_g, accel_y_g, accel_z_g = values[13] / 1000.0, values[14] / 1000.0, values[15] / 1000.0
+        # v3: BMA400(TCA CH0)。コネクタ後ろ向き取付+データシート軸図から、
+        # 生値のX=車体右/Y=車体前方に既に一致すると判断(軸補正なしでそのまま使用)。
+        bma_accel_x_g, bma_accel_y_g, bma_accel_z_g = values[16] / 1000.0, values[17] / 1000.0, values[18] / 1000.0
+        sensor_yaw_deg = (values[19] / 100.0, values[20] / 100.0, values[21] / 100.0)
+        sensor_timestamp_ms = (values[22], values[23], values[24])
+        reason_index, distance_index = 25, 26
+    elif version == PROTOCOL_VERSION and len(raw) == FRAME_SIZE_V4:
+        values = struct.unpack(FRAME_FORMAT_V4, raw)
+        accel_x_g, accel_y_g, accel_z_g = values[13] / 1000.0, values[14] / 1000.0, values[15] / 1000.0
+        bma_accel_x_g, bma_accel_y_g, bma_accel_z_g = values[16] / 1000.0, values[17] / 1000.0, values[18] / 1000.0
+        # v4: キャリブレーション(BtnB)の進行状況。非キャリブ中はcal_round/cal_pass=0、
+        # cal_drift_degは直近ラウンド確定時の値が残る。
+        trim = values[19] / 1000.0
+        cal_round, cal_pass = values[20], values[21]
+        cal_drift_deg = values[22] / 100.0
+        sensor_yaw_deg = (values[23] / 100.0, values[24] / 100.0, values[25] / 100.0)
+        sensor_timestamp_ms = (values[26], values[27], values[28])
+        reason_index, distance_index = 29, 30
     else:
         raise ValueError(f"unsupported protocol version/size {version}/{len(raw)}")
     return PointCloudFrame(
@@ -304,6 +365,8 @@ def decode_frame(raw: bytes, sender: str = "") -> PointCloudFrame:
         sensor_timestamp_ms=sensor_timestamp_ms,
         reason=values[reason_index].split(b"\0", 1)[0].decode("ascii", errors="replace"),
         distances=tuple(values[distance_index:distance_index + 192]), sender=sender,
+        bma_accel_x_g=bma_accel_x_g, bma_accel_y_g=bma_accel_y_g, bma_accel_z_g=bma_accel_z_g,
+        trim=trim, cal_round=cal_round, cal_pass=cal_pass, cal_drift_deg=cal_drift_deg,
     )
 
 
@@ -380,6 +443,7 @@ class PointCloudViewer(tk.Tk):
         self.motor_var = tk.StringVar(value="-")
         self.link_var = tk.StringVar(value="-")
         self.map_var = tk.StringVar(value="-")
+        self.cal_var = tk.StringVar(value="-")
         self._build_ui(port, max_speed_mm_s)
         self._receiver.start()
         self.after(30, self._poll)
@@ -402,8 +466,8 @@ class PointCloudViewer(tk.Tk):
         side.pack_propagate(False)
         for title, var in (("STATE", self.state_var), ("REASON", self.reason_var),
                            ("IMU / TARGET", self.pose_var), ("CLEARANCE", self.clear_var),
-                           ("MOTOR", self.motor_var), ("MAP", self.map_var),
-                           ("LINK", self.link_var)):
+                           ("MOTOR", self.motor_var), ("CALIBRATION", self.cal_var),
+                           ("MAP", self.map_var), ("LINK", self.link_var)):
             ttk.Label(side, text=title, font=("TkDefaultFont", 9, "bold")).pack(anchor=tk.W, pady=(8, 0))
             ttk.Label(side, textvariable=var, wraplength=230).pack(anchor=tk.W)
         ttk.Separator(side).pack(fill=tk.X, pady=12)
@@ -443,10 +507,15 @@ class PointCloudViewer(tk.Tk):
     def _update_labels(self, f: PointCloudFrame) -> None:
         self.state_var.set(STATE_NAMES.get(f.drive_state, f"UNKNOWN({f.drive_state})"))
         self.reason_var.set(f.reason or "-")
+        bma_line = (
+            f"BMA X {f.bma_accel_x_g:+.3f}g / Y {f.bma_accel_y_g:+.3f}g"
+            if f.bma_ok else "BMA ---"
+        )
         self.pose_var.set(
             f"Yaw {f.yaw_deg:+.1f}° / Target {f.target_yaw_deg:+.1f}°\n"
             f"Map heading {self._map.heading_deg:+.1f}°\n"
-            f"Accel X {f.accel_x_g:+.3f}g / Y {f.accel_y_g:+.3f}g"
+            f"M5  X {f.accel_x_g:+.3f}g / Y {f.accel_y_g:+.3f}g\n"
+            f"{bma_line}"
         )
         self.clear_var.set(f"Left {f.left_clearance_mm}mm\nRight {f.right_clearance_mm}mm")
         self.motor_var.set(f"L {f.motor_left:+d} / R {f.motor_right:+d}")
@@ -458,8 +527,19 @@ class PointCloudViewer(tk.Tk):
         self.link_var.set(
             f"Drive {'ON' if f.drive_enabled else 'OFF'}\nIMU {'OK' if f.imu_ready else 'WAIT'}\n"
             f"AM {'ONLINE' if f.am_online else 'OFFLINE'}\n"
-            f"Wi-Fi {'CLIENT' if f.wifi_client else 'NO CLIENT'}"
+            f"Wi-Fi {'CLIENT' if f.wifi_client else 'NO CLIENT'}\n"
+            f"BMA400 {'OK' if f.bma_ok else 'NG/WAIT'}"
         )
+        if f.drive_state == 3:  # DS_CALIBRATING
+            self.cal_var.set(
+                f"Round {f.cal_round} / Pass {f.cal_pass}\n"
+                f"Drift(直近ラウンド) {f.cal_drift_deg:+.1f}°\n"
+                f"Trim {f.trim:+.3f}\n{f.reason}"
+            )
+        elif f.cal_round or f.cal_pass:
+            self.cal_var.set(f"(前回) Drift {f.cal_drift_deg:+.1f}° / Trim {f.trim:+.3f}")
+        else:
+            self.cal_var.set(f"Trim {f.trim:+.3f}")
 
     def _draw(self) -> None:
         c = self.canvas
@@ -607,6 +687,59 @@ def run_self_test() -> None:
     legacy = decode_frame(bytes(legacy_raw), "127.0.0.1")
     assert legacy.reason == "V1_TEST" and legacy.accel_x_g == 0.0
 
+    # v3: BMA400(TCA CH0)追加分。flags=0x3Fでbma_ok(bit5)も立てる。
+    v3_values = [MAGIC, 3, 0, 0x3F, 0, 123456, 125, 250, 250, 80, 90, 190, 188,
+                 25, -40, 5,
+                 10, -20, 1000,
+                 100, 110, 120,
+                 123400, 123410, 123420,
+                 b"SELF_TEST_V3".ljust(16, b"\0"), *distances, 0]
+    v3_raw = bytearray(struct.pack(FRAME_FORMAT_V3, *v3_values))
+    struct.pack_into("<H", v3_raw, len(v3_raw) - 2, crc16_ccitt(v3_raw[:-2]))
+    frame_v3 = decode_frame(bytes(v3_raw), "127.0.0.1")
+    assert FRAME_SIZE_V3 == 458 and frame_v3.bma_ok
+    assert frame_v3.bma_accel_x_g == 0.010 and frame_v3.bma_accel_y_g == -0.020 and frame_v3.bma_accel_z_g == 1.000
+    assert frame_v3.sensor_yaw_deg == (1.0, 1.1, 1.2)
+
+    # v4: キャリブ進行状況(trimMilli/calRound/calPass/calDriftCdeg)追加分。
+    v4_values = [MAGIC, 4, 3, 0x3F, 0, 123456, 125, 250, 250, 80, 90, 190, 188,
+                 25, -40, 5,
+                 10, -20, 1000,
+                 150,
+                 2, 3,
+                 -320,
+                 100, 110, 120,
+                 123400, 123410, 123420,
+                 b"CAL R2 P3/3".ljust(16, b"\0"), *distances, 0]
+    v4_raw = bytearray(struct.pack(FRAME_FORMAT_V4, *v4_values))
+    struct.pack_into("<H", v4_raw, len(v4_raw) - 2, crc16_ccitt(v4_raw[:-2]))
+    frame_v4 = decode_frame(bytes(v4_raw), "127.0.0.1")
+    assert FRAME_SIZE_V4 == 464 and frame_v4.drive_state == 3
+    assert frame_v4.trim == 0.150 and frame_v4.cal_round == 2 and frame_v4.cal_pass == 3
+    assert abs(frame_v4.cal_drift_deg - (-3.20)) < 1e-9
+    assert frame_v4.reason == "CAL R2 P3/3"
+
+    # BMA400ブレンド: bma_ok時は平均、bma不可時はM5のみになることを確認。
+    # accel_x_gはM5の生値(update()内でworld_x向けに符号反転される)なので、
+    # world側で+0.2gにしたい場合は-0.2gを入れておく。
+    blend_base = replace(frame_v3, timestamp_ms=1000, drive_state=0, flags=0x23,
+                          yaw_deg=0.0, motor_left=0, motor_right=0,
+                          accel_x_g=-0.2, accel_y_g=0.0, accel_z_g=0.0,
+                          bma_accel_x_g=0.0, bma_accel_y_g=0.0, bma_accel_z_g=0.0)
+    blend_mapper = DeadReckoningMap(500.0)
+    blend_mapper.update(blend_base)
+    blend_mapper.update(replace(blend_base, timestamp_ms=1100))
+    blended_vx = blend_mapper.velocity_x_mm_s
+
+    solo_mapper = DeadReckoningMap(500.0)
+    solo_base = replace(blend_base, flags=0x03)  # bit5を落としbma_ok=False
+    solo_mapper.update(solo_base)
+    solo_mapper.update(replace(solo_base, timestamp_ms=1100))
+    solo_vx = solo_mapper.velocity_x_mm_s
+
+    assert solo_vx > 0.0
+    assert 0.0 < blended_vx < solo_vx
+
     mapper = DeadReckoningMap(500.0)
     moving = replace(frame, timestamp_ms=1000, flags=0x03, yaw_deg=0.0,
                      motor_left=255, motor_right=255,
@@ -626,8 +759,8 @@ def run_self_test() -> None:
     assert abs(mapper.x_mm - before_x) < 0.01 and abs(mapper.y_mm - before_y) < 0.01
     assert mapper.speed_mm_s == 0.0
     assert abs(mapper.heading_deg - 40.0) < 0.01
-    print(f"self-test OK: v1={FRAME_SIZE_V1}, v2={FRAME_SIZE_V2}, udp_port={UDP_PORT}, "
-          "accel=OK, turn_tracking=OK, mapping=OK")
+    print(f"self-test OK: v1={FRAME_SIZE_V1}, v2={FRAME_SIZE_V2}, v3={FRAME_SIZE_V3}, v4={FRAME_SIZE_V4}, "
+          f"udp_port={UDP_PORT}, accel=OK, turn_tracking=OK, mapping=OK, bma_blend=OK, cal_stream=OK")
 
 
 def main() -> None:

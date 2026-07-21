@@ -8,6 +8,15 @@
     - target changes are smoothed
     - kick is short and has cooldown
 
+  v2 (paired with M5 v16):
+    - applyKickToOutput() no longer overrides direction on a sign-change kick
+      while actual is still ramping through zero. Previously a sign change
+      (even a tiny one, e.g. +4 -> -4 from the M5-side slew) instantly forced
+      actual's output to full KICK_CMD in the NEW direction regardless of
+      actual's current (old-direction) magnitude, defeating approachCmd's
+      "always pass through zero" reversal safety. Now the kick only applies
+      once actual's own sign already matches kickSign.
+
   Wiring:
     L298N IN1 -> AM D22 / PA0
     L298N IN2 -> AM D23 / PA1
@@ -146,7 +155,14 @@ int approachCmd(int cur, int tgt) {
 int applyKickToOutput(int actual, unsigned long kickUntil, int kickSign) {
   if (actual == 0) return 0;
 
-  if (millis() < kickUntil && kickSign != 0) {
+  // v2: キックはactualの符号が既にkickSignと一致している間だけ効かせる。
+  // 符号反転の直後はactualがまだ旧符号のまま0へ向けてランプ中(approachCmdの
+  // REVERSE_ZERO_STEPによる「必ず0を経由する」処理の途中)であり、そこでkickSignを
+  // 無条件適用すると瞬間フルパワーの逆転になってしまう(approachCmdの安全策を無効化する)。
+  // actualが実際に新符号側へ入ってから初めてキックを乗せることで、
+  // 0経由の滑らかな反転を保ったまま「発進/転換直後の粘り抜け」だけ助ける。
+  int actualSign = (actual > 0) ? 1 : -1;
+  if (millis() < kickUntil && kickSign != 0 && actualSign == kickSign) {
     int mag = max(abs(actual), KICK_CMD);
     return kickSign * constrain(mag, 0, 255);
   }
