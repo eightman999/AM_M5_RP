@@ -46,8 +46,9 @@ const int RAMP_UP_STEP = 20;
 const int RAMP_DOWN_STEP = 22;
 const int REVERSE_ZERO_STEP = 36;
 
-// L298N + loaded robot needs enough duty to overcome static friction.
-const int MIN_EFFECTIVE_CMD = 132;
+// v26: 車体軽量化により低速でも走行可能になったため、実走速度の下限を下げる。
+// 発進時はKICK_CMDが別途働くので、ここは連続走行を維持できる最低値として調整する。
+const int MIN_EFFECTIVE_CMD = 100;
 
 // Short kick only when starting from rest, not on every target update.
 const int KICK_CMD = 225;
